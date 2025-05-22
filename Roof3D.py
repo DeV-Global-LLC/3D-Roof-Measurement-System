@@ -8,7 +8,7 @@ import open3d as o3d
 import pdal
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, BackgroundTasks
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from pydantic import BaseModel
 import tempfile
 import cv2
@@ -42,25 +42,18 @@ class Config:
     DEEPROOF_MODEL_CONFIG = os.getenv("DEEPROOF_MODEL_CONFIG", "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
     MIN_ROOF_HEIGHT = 2.5  # meters
     CACHE_SIZE = 100  # Number of items to cache
+    BATCH_MAX_SIZE = 100  # Maximum number of tiles in batch processing
 
 config = Config()
 
-# --- Initialize DeepRoof Model ---
-def initialize_deeproof_model():
-    cfg = get_cfg()
-    cfg.merge_from_file(model_zoo.get_config_file(config.DEEPROOF_MODEL_CONFIG))
-    cfg.MODEL.WEIGHTS = config.DEEPROOF_MODEL_WEIGHTS
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7  # Confidence threshold
-    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1  # Only roof class
-    cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    predictor = DefaultPredictor(cfg)
-    return predictor
-
-# Load model at startup
-deeproof_predictor = initialize_deeproof_model()
-
 # --- Models ---
+class BoundingBox(BaseModel):
+    minx: float
+    miny: float
+    maxx: float
+    maxy: float
+    debug: Optional[bool] = False
+
 class LocationRequest(BaseModel):
     address: Optional[str] = None
     lat: Optional[float] = None
@@ -79,6 +72,21 @@ class MeasurementResult(BaseModel):
     data_source: str
     confidence: float
     visualization: Optional[str] = None  # Base64 encoded debug image
+
+# --- Initialize DeepRoof Model ---
+def initialize_deeproof_model():
+    cfg = get_cfg()
+    cfg.merge_from_file(model_zoo.get_config_file(config.DEEPROOF_MODEL_CONFIG))
+    cfg.MODEL.WEIGHTS = config.DEEPROOF_MODEL_WEIGHTS
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7  # Confidence threshold
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1  # Only roof class
+    cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    predictor = DefaultPredictor(cfg)
+    return predictor
+
+# Load model at startup
+deeproof_predictor = initialize_deeproof_model()
 
 # --- Helper Functions ---
 @tenacity.retry(
@@ -269,6 +277,42 @@ def calculate_roof_metrics(roof_polygon: Polygon, laz_file: str) -> dict:
         logger.error(f"Roof metrics calculation failed: {str(e)}")
         raise
 
+def process_single_roof(bbox: list, debug: bool = False) -> dict:
+    """Process a single roof with error handling"""
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            img_future = executor.submit(fetch_usgs_naip, tuple(bbox))
+            lidar_future = executor.submit(fetch_lidar, tuple(bbox))
+            image_path = img_future.result()
+            laz_path = lidar_future.result()
+
+        roof_polygon, confidence, outputs = detect_roof(image_path)
+        metrics = calculate_roof_metrics(roof_polygon, laz_path)
+        
+        visualization = None
+        if debug:
+            visualization = create_visual_debug(image_path, outputs, roof_polygon)
+        
+        # Cleanup
+        os.unlink(image_path)
+        os.unlink(laz_path)
+
+        return {
+            "area_sqft": metrics["area_m2"] * 10.764,
+            "area_sqm": metrics["area_m2"],
+            "slope_degrees": metrics["slope_degrees"],
+            "pitch": f"{round(np.tan(np.radians(metrics['slope_degrees'])) * 12, 1)}:12",
+            "roof_type": classify_roof_type(metrics["slope_degrees"]),
+            "vertices": list(roof_polygon.exterior.coords),
+            "geometry": json.loads(gpd.GeoSeries([roof_polygon]).to_json())["features"][0]["geometry"],
+            "data_source": "USGS NAIP + OpenTopography",
+            "confidence": confidence,
+            "visualization": visualization
+        }
+    except Exception as e:
+        logger.error(f"Error processing bbox {bbox}: {str(e)}")
+        return {"error": str(e), "bbox": bbox}
+
 # --- API Endpoints ---
 @app.post("/measure", response_model=MeasurementResult)
 async def measure_roof(
@@ -289,42 +333,33 @@ async def measure_roof(
         else:
             raise HTTPException(400, "Address geocoding not implemented")
 
-        # Step 2: Fetch data (parallel with caching)
-        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-            img_future = executor.submit(fetch_usgs_naip, tuple(bbox))  # Tuple for caching
-            lidar_future = executor.submit(fetch_lidar, tuple(bbox))    # Tuple for caching
-            image_path = img_future.result()
-            laz_path = lidar_future.result()
-
-        # Step 3: Process
-        roof_polygon, confidence, outputs = detect_roof(image_path)
-        metrics = calculate_roof_metrics(roof_polygon, laz_path)
-        
-        # Create visualization if requested
-        visualization = None
-        if location.debug:
-            visualization = create_visual_debug(image_path, outputs, roof_polygon)
-        
-        # Step 4: Cleanup (async)
-        background_tasks.add_task(os.unlink, image_path)
-        background_tasks.add_task(os.unlink, laz_path)
-
-        return {
-            "area_sqft": metrics["area_m2"] * 10.764,
-            "area_sqm": metrics["area_m2"],
-            "slope_degrees": metrics["slope_degrees"],
-            "pitch": f"{round(np.tan(np.radians(metrics['slope_degrees'])) * 12, 1)}:12",
-            "roof_type": classify_roof_type(metrics["slope_degrees"]),
-            "vertices": list(roof_polygon.exterior.coords),
-            "geometry": json.loads(gpd.GeoSeries([roof_polygon]).to_json())["features"][0]["geometry"],
-            "data_source": "USGS NAIP + OpenTopography",
-            "confidence": confidence,
-            "visualization": visualization
-        }
+        return process_single_roof(bbox, location.debug)
 
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         raise HTTPException(500, str(e))
+
+@app.post("/batch/process/")
+async def batch_process(coords: List[BoundingBox], background_tasks: BackgroundTasks):
+    """Process multiple roofs in batch"""
+    if len(coords) > config.BATCH_MAX_SIZE:
+        raise HTTPException(400, f"Maximum batch size is {config.BATCH_MAX_SIZE}")
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+        futures = []
+        for box in coords:
+            bbox = [box.minx, box.miny, box.maxx, box.maxy]
+            futures.append(executor.submit(process_single_roof, bbox, box.debug))
+        
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as e:
+                logger.error(f"Error in batch processing: {str(e)}")
+                results.append({"error": str(e)})
+    
+    return results
 
 # --- Run ---
 if __name__ == "__main__":
