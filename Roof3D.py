@@ -8,7 +8,7 @@ import open3d as o3d
 import pdal
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, BackgroundTasks
-from typing import Optional
+from typing import Optional, Tuple
 from pydantic import BaseModel
 import tempfile
 import cv2
@@ -22,6 +22,9 @@ import tenacity
 from datetime import datetime
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import base64
+from pyproj import CRS, Transformer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +40,8 @@ class Config:
     MAX_WORKERS = 4
     DEEPROOF_MODEL_WEIGHTS = os.getenv("DEEPROOF_MODEL_WEIGHTS", "model_final.pth")
     DEEPROOF_MODEL_CONFIG = os.getenv("DEEPROOF_MODEL_CONFIG", "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+    MIN_ROOF_HEIGHT = 2.5  # meters
+    CACHE_SIZE = 100  # Number of items to cache
 
 config = Config()
 
@@ -61,6 +66,7 @@ class LocationRequest(BaseModel):
     lat: Optional[float] = None
     lon: Optional[float] = None
     bbox: Optional[list] = None  # [minx, miny, maxx, maxy]
+    debug: Optional[bool] = False  # Whether to include debug visualization
 
 class MeasurementResult(BaseModel):
     area_sqft: float
@@ -72,6 +78,7 @@ class MeasurementResult(BaseModel):
     geometry: dict
     data_source: str
     confidence: float
+    visualization: Optional[str] = None  # Base64 encoded debug image
 
 # --- Helper Functions ---
 @tenacity.retry(
@@ -79,8 +86,10 @@ class MeasurementResult(BaseModel):
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
     before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
 )
-def fetch_usgs_naip(bbox: list, year: int = 2023) -> str:
-    """Fetch NAIP imagery from USGS EarthExplorer API"""
+@lru_cache(maxsize=config.CACHE_SIZE)
+def fetch_usgs_naip(bbox: tuple, year: int = 2023) -> str:
+    """Fetch NAIP imagery from USGS EarthExplorer API with caching"""
+    bbox = list(bbox)  # Convert back to list for API call
     url = "https://tnmaccess.nationalmap.gov/api/v1/products"
     params = {
         "datasets": "National Agriculture Imagery Program (NAIP)",
@@ -110,8 +119,10 @@ def fetch_usgs_naip(bbox: list, year: int = 2023) -> str:
     stop=tenacity.stop_after_attempt(3),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
 )
-def fetch_lidar(bbox: list) -> str:
-    """Fetch LiDAR data from OpenTopography"""
+@lru_cache(maxsize=config.CACHE_SIZE)
+def fetch_lidar(bbox: tuple) -> str:
+    """Fetch LiDAR data from OpenTopography with caching"""
+    bbox = list(bbox)  # Convert back to list for API call
     url = "https://portal.opentopography.org/API/globaldem"
     params = {
         "demtype": "LIDAR",
@@ -130,21 +141,28 @@ def fetch_lidar(bbox: list) -> str:
         tmp.write(response.content)
         return tmp.name
 
-def fetch_google_maps(bbox: list, zoom: int = 20) -> str:
-    """Fetch satellite imagery from Google Maps (paid)"""
-    if not config.GOOGLE_MAPS_API_KEY:
-        raise ValueError("Google Maps API key not configured")
+def create_visual_debug(img_path: str, outputs, polygon: Polygon) -> str:
+    """Create a base64 encoded debug visualization"""
+    img = cv2.imread(img_path)
+    v = Visualizer(img[:, :, ::-1], MetadataCatalog.get(deeproof_predictor.cfg.DATASETS.TRAIN[0]))
+    out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
     
-    center = f"{(bbox[1]+bbox[3])/2},{(bbox[0]+bbox[2])/2}"
-    size = "640x640"
-    url = f"https://maps.googleapis.com/maps/api/staticmap?center={center}&zoom={zoom}&size={size}&maptype=satellite&key={config.GOOGLE_MAPS_API_KEY}"
+    # Draw the simplified polygon
+    debug_img = out.get_image()[:, :, ::-1]
+    cv2.polylines(debug_img, 
+                 [np.array(polygon.exterior.coords, dtype=np.int32)],
+                 isClosed=True, color=(0, 255, 0), thickness=2)
     
-    response = requests.get(url)
-    response.raise_for_status()
-    
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(response.content)
-        return tmp.name
+    # Convert to base64
+    _, buffer = cv2.imencode('.jpg', debug_img)
+    return f"data:image/jpeg;base64,{base64.b64encode(buffer).decode()}"
+
+def calculate_projected_area(polygon: Polygon, src_crs: str = 'EPSG:4326') -> float:
+    """Calculate area in proper projected coordinates"""
+    gdf = gpd.GeoDataFrame(geometry=[polygon], crs=src_crs)
+    utm_crs = gdf.estimate_utm_crs()
+    projected = gdf.to_crs(utm_crs)
+    return projected.geometry[0].area
 
 def classify_roof_type(slope_degrees: float) -> str:
     """Classify roof based on slope"""
@@ -160,7 +178,7 @@ def classify_roof_type(slope_degrees: float) -> str:
         return "Very Steep Slope"
 
 # --- Core Processing ---
-def detect_roof(image_path: str) -> tuple[Polygon, float]:
+def detect_roof(image_path: str) -> Tuple[Polygon, float, dict]:
     """Detect roof polygons using DeepRoof model"""
     try:
         # Read and preprocess image
@@ -202,26 +220,28 @@ def detect_roof(image_path: str) -> tuple[Polygon, float]:
         if len(polygon.exterior.coords) > 100:
             polygon = polygon.simplify(5.0, preserve_topology=True)
         
-        return polygon, float(confidence)
+        return polygon, float(confidence), outputs
     
     except Exception as e:
         logger.error(f"Roof detection failed: {str(e)}")
         raise
 
 def calculate_roof_metrics(roof_polygon: Polygon, laz_file: str) -> dict:
-    """Calculate 3D roof metrics from LiDAR"""
+    """Calculate 3D roof metrics from LiDAR with elevation filtering"""
     try:
-        pipeline = {
+        pipeline_json = {
             "pipeline": [
                 {"type": "readers.las", "filename": laz_file},
                 {"type": "filters.crop", "polygon": roof_polygon.wkt},
                 {"type": "filters.range", "limits": "Classification[6:6]"},  # Building points
+                {"type": "filters.hag_nn"},  # Height above ground
+                {"type": "filters.range", "limits": f"HeightAboveGround[{config.MIN_ROOF_HEIGHT}:]"},  # Min roof height
                 {"type": "filters.estimaterank", "knn": 8},
                 {"type": "filters.normal"},
             ]
         }
         
-        pipeline = pdal.Pipeline(json.dumps(pipeline))
+        pipeline = pdal.Pipeline(json.dumps(pipeline_json))
         pipeline.execute()
         
         if len(pipeline.arrays) == 0:
@@ -236,11 +256,8 @@ def calculate_roof_metrics(roof_polygon: Polygon, laz_file: str) -> dict:
         a, b, c, d = plane_model
         slope_deg = np.degrees(np.arccos(c / np.sqrt(a**2 + b**2 + c**2)))
         
-        # Calculate area (convert from pixels to m²)
-        with rasterio.open(laz_file.replace(".laz", ".tif")) as src:
-            transform = src.transform
-            pixel_area = transform[0] * transform[0]  # m² per pixel
-            area_m2 = roof_polygon.area * pixel_area
+        # Calculate area using proper projected coordinates
+        area_m2 = calculate_projected_area(roof_polygon)
         
         return {
             "slope_degrees": slope_deg,
@@ -272,16 +289,21 @@ async def measure_roof(
         else:
             raise HTTPException(400, "Address geocoding not implemented")
 
-        # Step 2: Fetch data (parallel)
+        # Step 2: Fetch data (parallel with caching)
         with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-            img_future = executor.submit(fetch_usgs_naip, bbox)
-            lidar_future = executor.submit(fetch_lidar, bbox)
+            img_future = executor.submit(fetch_usgs_naip, tuple(bbox))  # Tuple for caching
+            lidar_future = executor.submit(fetch_lidar, tuple(bbox))    # Tuple for caching
             image_path = img_future.result()
             laz_path = lidar_future.result()
 
         # Step 3: Process
-        roof_polygon, confidence = detect_roof(image_path)
+        roof_polygon, confidence, outputs = detect_roof(image_path)
         metrics = calculate_roof_metrics(roof_polygon, laz_path)
+        
+        # Create visualization if requested
+        visualization = None
+        if location.debug:
+            visualization = create_visual_debug(image_path, outputs, roof_polygon)
         
         # Step 4: Cleanup (async)
         background_tasks.add_task(os.unlink, image_path)
@@ -291,12 +313,13 @@ async def measure_roof(
             "area_sqft": metrics["area_m2"] * 10.764,
             "area_sqm": metrics["area_m2"],
             "slope_degrees": metrics["slope_degrees"],
-            "pitch": f"1:{round(1/np.tan(np.radians(metrics['slope_degrees'])), 2)}",
+            "pitch": f"{round(np.tan(np.radians(metrics['slope_degrees'])) * 12, 1)}:12",
             "roof_type": classify_roof_type(metrics["slope_degrees"]),
             "vertices": list(roof_polygon.exterior.coords),
-            "geometry": gpd.GeoSeries([roof_polygon]).__geo_interface__,
-            "data_source": "USGS NAIP + 3DEP LiDAR",
+            "geometry": json.loads(gpd.GeoSeries([roof_polygon]).to_json())["features"][0]["geometry"],
+            "data_source": "USGS NAIP + OpenTopography",
             "confidence": confidence,
+            "visualization": visualization
         }
 
     except Exception as e:
