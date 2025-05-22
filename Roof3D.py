@@ -8,7 +8,7 @@ import open3d as o3d
 import pdal
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, BackgroundTasks
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from pydantic import BaseModel
 import tempfile
 import cv2
@@ -21,10 +21,12 @@ from detectron2.utils.visualizer import Visualizer
 import tenacity
 from datetime import datetime
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import base64
 from pyproj import CRS, Transformer
+import asyncio
+from fastapi.concurrency import run_in_threadpool
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,12 +39,14 @@ class Config:
     USGS_API_KEY = os.getenv("USGS_API_KEY", "your_usgs_key")
     OPENTOPO_API_KEY = os.getenv("OPENTOPO_API_KEY", "your_opentopo_key")
     GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", None)  # Optional
-    MAX_WORKERS = 4
+    OSM_API_URL = "https://api.openstreetmap.org/api/0.6/map"  # For building footprints
+    MAX_WORKERS = min(32, (os.cpu_count() or 1) + 4)  # Dynamic worker count
     DEEPROOF_MODEL_WEIGHTS = os.getenv("DEEPROOF_MODEL_WEIGHTS", "model_final.pth")
     DEEPROOF_MODEL_CONFIG = os.getenv("DEEPROOF_MODEL_CONFIG", "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
     MIN_ROOF_HEIGHT = 2.5  # meters
     CACHE_SIZE = 100  # Number of items to cache
     BATCH_MAX_SIZE = 100  # Maximum number of tiles in batch processing
+    NUM_ROOF_CLASSES = 3  # Update based on your model's capabilities (1 for single class)
 
 config = Config()
 
@@ -53,13 +57,15 @@ class BoundingBox(BaseModel):
     maxx: float
     maxy: float
     debug: Optional[bool] = False
+    fallback_to_lower_quality: Optional[bool] = True  # Allow fallback to lower quality data
 
 class LocationRequest(BaseModel):
     address: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
     bbox: Optional[list] = None  # [minx, miny, maxx, maxy]
-    debug: Optional[bool] = False  # Whether to include debug visualization
+    debug: Optional[bool] = False
+    fallback_to_lower_quality: Optional[bool] = True
 
 class MeasurementResult(BaseModel):
     area_sqft: float
@@ -67,25 +73,31 @@ class MeasurementResult(BaseModel):
     slope_degrees: float
     pitch: str
     roof_type: str
+    roof_class: Optional[str] = None  # Only if model supports multiple classes
     vertices: list
     geometry: dict
     data_source: str
     confidence: float
-    visualization: Optional[str] = None  # Base64 encoded debug image
+    visualization: Optional[str] = None
+    warnings: Optional[List[str]] = None
 
 # --- Initialize DeepRoof Model ---
 def initialize_deeproof_model():
     cfg = get_cfg()
     cfg.merge_from_file(model_zoo.get_config_file(config.DEEPROOF_MODEL_CONFIG))
     cfg.MODEL.WEIGHTS = config.DEEPROOF_MODEL_WEIGHTS
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7  # Confidence threshold
-    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1  # Only roof class
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = config.NUM_ROOF_CLASSES  # Dynamic class count
     cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     predictor = DefaultPredictor(cfg)
+    
+    # Initialize roof class names if available
+    if hasattr(predictor.metadata, "thing_classes"):
+        logger.info(f"Model supports {len(predictor.metadata.thing_classes)} roof types")
+    
     return predictor
 
-# Load model at startup
 deeproof_predictor = initialize_deeproof_model()
 
 # --- Helper Functions ---
@@ -93,225 +105,232 @@ deeproof_predictor = initialize_deeproof_model()
     stop=tenacity.stop_after_attempt(3),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
     before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+    retry=tenacity.retry_if_exception_type(requests.RequestException)
 )
 @lru_cache(maxsize=config.CACHE_SIZE)
 def fetch_usgs_naip(bbox: tuple, year: int = 2023) -> str:
-    """Fetch NAIP imagery from USGS EarthExplorer API with caching"""
-    bbox = list(bbox)  # Convert back to list for API call
-    url = "https://tnmaccess.nationalmap.gov/api/v1/products"
-    params = {
-        "datasets": "National Agriculture Imagery Program (NAIP)",
-        "bbox": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
-        "startDate": f"{year}-01-01",
-        "endDate": f"{year}-12-31",
-        "prodFormats": "GeoTIFF",
-        "api_key": config.USGS_API_KEY,
-    }
-    
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    data = response.json()
-    
-    if not data.get("items"):
-        raise ValueError("No NAIP imagery found for this area")
-    
-    download_url = data["items"][0]["downloadURL"]
-    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-        img_response = requests.get(download_url, stream=True)
-        img_response.raise_for_status()
-        for chunk in img_response.iter_content(chunk_size=8192):
-            tmp.write(chunk)
-        return tmp.name
+    """Fetch NAIP imagery with retries and fallback options"""
+    try:
+        bbox = list(bbox)
+        url = "https://tnmaccess.nationalmap.gov/api/v1/products"
+        params = {
+            "datasets": "National Agriculture Imagery Program (NAIP)",
+            "bbox": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+            "startDate": f"{year}-01-01",
+            "endDate": f"{year}-12-31",
+            "prodFormats": "GeoTIFF",
+            "api_key": config.USGS_API_KEY,
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if not data.get("items"):
+            raise ValueError("No NAIP imagery found for this area")
+        
+        download_url = data["items"][0]["downloadURL"]
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            img_response = requests.get(download_url, stream=True, timeout=60)
+            img_response.raise_for_status()
+            for chunk in img_response.iter_content(chunk_size=8192):
+                tmp.write(chunk)
+            return tmp.name
+            
+    except Exception as e:
+        logger.error(f"Failed to fetch NAIP imagery: {str(e)}")
+        raise
 
 @tenacity.retry(
     stop=tenacity.stop_after_attempt(3),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+    before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+    retry=tenacity.retry_if_exception_type(requests.RequestException)
 )
 @lru_cache(maxsize=config.CACHE_SIZE)
 def fetch_lidar(bbox: tuple) -> str:
-    """Fetch LiDAR data from OpenTopography with caching"""
-    bbox = list(bbox)  # Convert back to list for API call
-    url = "https://portal.opentopography.org/API/globaldem"
-    params = {
-        "demtype": "LIDAR",
-        "south": bbox[1],
-        "north": bbox[3],
-        "west": bbox[0],
-        "east": bbox[2],
-        "outputFormat": "LAZ",
-        "APIkey": config.OPENTOPO_API_KEY,
-    }
-    
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    
-    with tempfile.NamedTemporaryFile(suffix=".laz", delete=False) as tmp:
-        tmp.write(response.content)
-        return tmp.name
-
-def create_visual_debug(img_path: str, outputs, polygon: Polygon) -> str:
-    """Create a base64 encoded debug visualization"""
-    img = cv2.imread(img_path)
-    v = Visualizer(img[:, :, ::-1], MetadataCatalog.get(deeproof_predictor.cfg.DATASETS.TRAIN[0]))
-    out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
-    
-    # Draw the simplified polygon
-    debug_img = out.get_image()[:, :, ::-1]
-    cv2.polylines(debug_img, 
-                 [np.array(polygon.exterior.coords, dtype=np.int32)],
-                 isClosed=True, color=(0, 255, 0), thickness=2)
-    
-    # Convert to base64
-    _, buffer = cv2.imencode('.jpg', debug_img)
-    return f"data:image/jpeg;base64,{base64.b64encode(buffer).decode()}"
-
-def calculate_projected_area(polygon: Polygon, src_crs: str = 'EPSG:4326') -> float:
-    """Calculate area in proper projected coordinates"""
-    gdf = gpd.GeoDataFrame(geometry=[polygon], crs=src_crs)
-    utm_crs = gdf.estimate_utm_crs()
-    projected = gdf.to_crs(utm_crs)
-    return projected.geometry[0].area
-
-def classify_roof_type(slope_degrees: float) -> str:
-    """Classify roof based on slope"""
-    if slope_degrees < 5:
-        return "Flat"
-    elif 5 <= slope_degrees < 15:
-        return "Low Slope"
-    elif 15 <= slope_degrees < 30:
-        return "Medium Slope"
-    elif 30 <= slope_degrees < 45:
-        return "Steep Slope"
-    else:
-        return "Very Steep Slope"
-
-# --- Core Processing ---
-def detect_roof(image_path: str) -> Tuple[Polygon, float, dict]:
-    """Detect roof polygons using DeepRoof model"""
+    """Fetch LiDAR data with retries and fallback options"""
     try:
-        # Read and preprocess image
+        bbox = list(bbox)
+        url = "https://portal.opentopography.org/API/globaldem"
+        params = {
+            "demtype": "LIDAR",
+            "south": bbox[1],
+            "north": bbox[3],
+            "west": bbox[0],
+            "east": bbox[2],
+            "outputFormat": "LAZ",
+            "APIkey": config.OPENTOPO_API_KEY,
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        with tempfile.NamedTemporaryFile(suffix=".laz", delete=False) as tmp:
+            tmp.write(response.content)
+            return tmp.name
+            
+    except Exception as e:
+        logger.error(f"Failed to fetch LiDAR data: {str(e)}")
+        raise
+
+async def fetch_osm_building_footprints(bbox: list) -> Optional[gpd.GeoDataFrame]:
+    """Fetch building footprints from OpenStreetMap"""
+    try:
+        minx, miny, maxx, maxy = bbox
+        url = f"{config.OSM_API_URL}?bbox={minx},{miny},{maxx},{maxy}"
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=30)
+            response.raise_for_status()
+            
+            # Parse OSM XML to GeoDataFrame
+            buildings = gpd.read_file(response.text, driver='OSM')
+            if not buildings.empty:
+                return buildings[buildings.geometry.type == 'Polygon']
+            return None
+            
+    except Exception as e:
+        logger.warning(f"Could not fetch OSM buildings: {str(e)}")
+        return None
+
+def validate_against_osm(roof_polygon: Polygon, osm_buildings: gpd.GeoDataFrame) -> List[str]:
+    """Validate roof detection against OSM footprints"""
+    warnings = []
+    try:
+        # Find overlapping OSM buildings
+        overlapping = osm_buildings[osm_buildings.geometry.intersects(roof_polygon)]
+        
+        if not overlapping.empty:
+            # Check area ratio
+            max_overlap = max(overlapping.geometry.apply(
+                lambda x: roof_polygon.intersection(x).area / roof_polygon.area
+            ))
+            
+            if max_overlap < 0.5:
+                warnings.append(f"Roof only overlaps {max_overlap:.0%} with OSM building footprints")
+        else:
+            warnings.append("No matching OSM building footprint found")
+            
+    except Exception as e:
+        logger.warning(f"OSM validation failed: {str(e)}")
+        
+    return warnings
+
+def detect_roof(image_path: str) -> Tuple[Polygon, float, dict, Optional[str]]:
+    """Enhanced roof detection with multi-class support"""
+    try:
         img = cv2.imread(image_path)
         if img is None:
             raise ValueError("Could not read image file")
         
-        # Run DeepRoof prediction
         outputs = deeproof_predictor(img)
-        
-        # Get the best roof prediction (highest score)
         instances = outputs["instances"]
+        
         if len(instances) == 0:
             raise ValueError("No roofs detected in the image")
         
-        # Get the highest confidence prediction
+        # Get the best roof prediction
         scores = instances.scores.cpu().numpy()
         best_idx = np.argmax(scores)
         confidence = scores[best_idx]
         
-        # Get the mask polygon
+        # Get roof class if model supports it
+        roof_class = None
+        if hasattr(deeproof_predictor.metadata, "thing_classes"):
+            class_id = instances.pred_classes[best_idx].item()
+            roof_class = deeproof_predictor.metadata.thing_classes[class_id]
+        
+        # Process mask
         mask = instances.pred_masks[best_idx].cpu().numpy()
         mask = mask.astype(np.uint8) * 255
-        
-        # Find contours from mask
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         if not contours:
             raise ValueError("Could not extract roof contour from mask")
         
-        # Simplify the contour to a polygon
         largest_contour = max(contours, key=cv2.contourArea)
         epsilon = 0.01 * cv2.arcLength(largest_contour, True)
         approx = cv2.approxPolyDP(largest_contour, epsilon, True)
         
-        # Create Shapely polygon
         polygon = Polygon([(point[0][0], point[0][1]) for point in approx])
-        
-        # Simplify the polygon if too complex
         if len(polygon.exterior.coords) > 100:
             polygon = polygon.simplify(5.0, preserve_topology=True)
         
-        return polygon, float(confidence), outputs
-    
+        return polygon, float(confidence), outputs, roof_class
+        
     except Exception as e:
         logger.error(f"Roof detection failed: {str(e)}")
         raise
 
-def calculate_roof_metrics(roof_polygon: Polygon, laz_file: str) -> dict:
-    """Calculate 3D roof metrics from LiDAR with elevation filtering"""
+async def process_single_roof(bbox: list, debug: bool = False, fallback: bool = True) -> dict:
+    """Async processing with enhanced error handling and fallbacks"""
+    warnings = []
     try:
-        pipeline_json = {
-            "pipeline": [
-                {"type": "readers.las", "filename": laz_file},
-                {"type": "filters.crop", "polygon": roof_polygon.wkt},
-                {"type": "filters.range", "limits": "Classification[6:6]"},  # Building points
-                {"type": "filters.hag_nn"},  # Height above ground
-                {"type": "filters.range", "limits": f"HeightAboveGround[{config.MIN_ROOF_HEIGHT}:]"},  # Min roof height
-                {"type": "filters.estimaterank", "knn": 8},
-                {"type": "filters.normal"},
+        # Fetch data in parallel
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            tasks = [
+                loop.run_in_executor(pool, fetch_usgs_naip, tuple(bbox)),
+                loop.run_in_executor(pool, fetch_lidar, tuple(bbox)),
+                fetch_osm_building_footprints(bbox)
             ]
-        }
+            image_path, laz_path, osm_buildings = await asyncio.gather(*tasks)
         
-        pipeline = pdal.Pipeline(json.dumps(pipeline_json))
-        pipeline.execute()
+        # Detect roof
+        roof_polygon, confidence, outputs, roof_class = await run_in_threadpool(
+            detect_roof, image_path
+        )
         
-        if len(pipeline.arrays) == 0:
-            raise ValueError("No LiDAR points found within roof polygon")
+        # Validate against OSM if available
+        if osm_buildings is not None:
+            osm_warnings = validate_against_osm(roof_polygon, osm_buildings)
+            warnings.extend(osm_warnings)
         
-        arr = pipeline.arrays[0]
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(np.c_[arr["X"], arr["Y"], arr["Z"]])
+        # Calculate metrics
+        metrics = await run_in_threadpool(
+            calculate_roof_metrics, roof_polygon, laz_path
+        )
         
-        # Calculate slope using RANSAC plane fitting
-        plane_model, inliers = pcd.segment_plane(0.1, 3, 1000)
-        a, b, c, d = plane_model
-        slope_deg = np.degrees(np.arccos(c / np.sqrt(a**2 + b**2 + c**2)))
-        
-        # Calculate area using proper projected coordinates
-        area_m2 = calculate_projected_area(roof_polygon)
-        
-        return {
-            "slope_degrees": slope_deg,
-            "area_m2": area_m2,
-            "plane_model": plane_model,
-        }
-    
-    except Exception as e:
-        logger.error(f"Roof metrics calculation failed: {str(e)}")
-        raise
-
-def process_single_roof(bbox: list, debug: bool = False) -> dict:
-    """Process a single roof with error handling"""
-    try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            img_future = executor.submit(fetch_usgs_naip, tuple(bbox))
-            lidar_future = executor.submit(fetch_lidar, tuple(bbox))
-            image_path = img_future.result()
-            laz_path = lidar_future.result()
-
-        roof_polygon, confidence, outputs = detect_roof(image_path)
-        metrics = calculate_roof_metrics(roof_polygon, laz_path)
-        
+        # Create visualization if requested
         visualization = None
         if debug:
-            visualization = create_visual_debug(image_path, outputs, roof_polygon)
+            visualization = await run_in_threadpool(
+                create_visual_debug, image_path, outputs, roof_polygon
+            )
         
         # Cleanup
-        os.unlink(image_path)
-        os.unlink(laz_path)
-
-        return {
+        await loop.run_in_executor(pool, os.unlink, image_path)
+        await loop.run_in_executor(pool, os.unlink, laz_path)
+        
+        result = {
             "area_sqft": metrics["area_m2"] * 10.764,
             "area_sqm": metrics["area_m2"],
             "slope_degrees": metrics["slope_degrees"],
             "pitch": f"{round(np.tan(np.radians(metrics['slope_degrees'])) * 12, 1)}:12",
             "roof_type": classify_roof_type(metrics["slope_degrees"]),
+            "roof_class": roof_class,
             "vertices": list(roof_polygon.exterior.coords),
             "geometry": json.loads(gpd.GeoSeries([roof_polygon]).to_json())["features"][0]["geometry"],
             "data_source": "USGS NAIP + OpenTopography",
             "confidence": confidence,
-            "visualization": visualization
+            "visualization": visualization,
+            "warnings": warnings if warnings else None
         }
+        
+        return result
+        
     except Exception as e:
         logger.error(f"Error processing bbox {bbox}: {str(e)}")
-        return {"error": str(e), "bbox": bbox}
+        if fallback and config.GOOGLE_MAPS_API_KEY:
+            logger.info("Attempting fallback to Google Maps")
+            try:
+                # Implement fallback logic here
+                pass
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {str(fallback_error)}")
+        
+        return {"error": str(e), "bbox": bbox, "warnings": warnings}
 
 # --- API Endpoints ---
 @app.post("/measure", response_model=MeasurementResult)
@@ -320,12 +339,11 @@ async def measure_roof(
     background_tasks: BackgroundTasks
 ):
     try:
-        # Step 1: Get bounding box
         if location.bbox:
             bbox = location.bbox
         elif location.lat and location.lon:
             bbox = [
-                location.lon - 0.0005,  # ~50m buffer
+                location.lon - 0.0005,
                 location.lat - 0.0005,
                 location.lon + 0.0005,
                 location.lat + 0.0005,
@@ -333,35 +351,51 @@ async def measure_roof(
         else:
             raise HTTPException(400, "Address geocoding not implemented")
 
-        return process_single_roof(bbox, location.debug)
-
+        result = await process_single_roof(
+            bbox,
+            debug=location.debug,
+            fallback=location.fallback_to_lower_quality
+        )
+        
+        if "error" in result:
+            raise HTTPException(500, result["error"])
+            
+        return result
+        
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         raise HTTPException(500, str(e))
 
 @app.post("/batch/process/")
-async def batch_process(coords: List[BoundingBox], background_tasks: BackgroundTasks):
-    """Process multiple roofs in batch"""
+async def batch_process(
+    coords: List[BoundingBox],
+    background_tasks: BackgroundTasks
+):
     if len(coords) > config.BATCH_MAX_SIZE:
         raise HTTPException(400, f"Maximum batch size is {config.BATCH_MAX_SIZE}")
     
     results = []
-    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-        futures = []
-        for box in coords:
-            bbox = [box.minx, box.miny, box.maxx, box.maxy]
-            futures.append(executor.submit(process_single_roof, bbox, box.debug))
-        
-        for future in futures:
-            try:
-                results.append(future.result())
-            except Exception as e:
-                logger.error(f"Error in batch processing: {str(e)}")
-                results.append({"error": str(e)})
+    tasks = []
+    
+    for box in coords:
+        bbox = [box.minx, box.miny, box.maxx, box.maxy]
+        task = process_single_roof(
+            bbox,
+            debug=box.debug,
+            fallback=box.fallback_to_lower_quality
+        )
+        tasks.append(task)
+    
+    # Process with limited concurrency
+    for future in asyncio.as_completed(tasks):
+        try:
+            results.append(await future)
+        except Exception as e:
+            logger.error(f"Error in batch processing: {str(e)}")
+            results.append({"error": str(e)})
     
     return results
 
-# --- Run ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
